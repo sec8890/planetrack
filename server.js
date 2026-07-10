@@ -92,9 +92,23 @@ function normalize(grid) {
   return out;
 }
 
+// one-time diagnostic: is Railway's outbound network blocked entirely, or
+// is this specific to OpenSky? Remove once the real cause is known.
+let outboundDiagnostic = 'not run yet';
+async function checkOutboundConnectivity() {
+  try {
+    const res = await fetch('https://api.github.com', { signal: AbortSignal.timeout(8000) });
+    outboundDiagnostic = `api.github.com reachable, HTTP ${res.status}`;
+  } catch (err) {
+    const cause = err && err.cause ? ` (${err.cause.code || err.cause.message || err.cause})` : '';
+    outboundDiagnostic = `api.github.com FAILED: ${String(err)}${cause}`;
+  }
+  console.log('[diagnostic]', outboundDiagnostic);
+}
+
 async function refreshDensity() {
   try {
-    const res = await fetch(OPENSKY_URL);
+    const res = await fetch(OPENSKY_URL, { signal: AbortSignal.timeout(15000) });
     if (!res.ok) {
       lastError = `OpenSky returned HTTP ${res.status}`;
       console.error('[density] refresh failed:', lastError);
@@ -134,6 +148,7 @@ app.get('/api/density', (req, res) => {
     lastFetchAt,
     lastCount,
     error: lastError,
+    outboundDiagnostic, // TEMP: remove once the OpenSky connectivity issue is diagnosed
   });
 });
 
@@ -152,6 +167,7 @@ app.post('/api/density/refresh', async (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`planetrack server on http://localhost:${PORT}`);
+  checkOutboundConnectivity();
   refreshDensity();
   setInterval(refreshDensity, REFRESH_MS);
 });
