@@ -103,8 +103,12 @@ async function refreshDensity() {
     lastFetchAt = Date.now();
     console.log(`[density] refreshed from ${states.length} aircraft states at ${new Date(lastFetchAt).toISOString()}`);
   } catch (err) {
-    lastError = String(err);
-    console.error('[density] refresh failed:', err);
+    // Node's fetch wraps the real network error in a generic "TypeError:
+    // fetch failed" — the actual reason (DNS failure, connection refused,
+    // timeout, etc.) is on err.cause, which String(err) alone doesn't show
+    const cause = err && err.cause ? ` (${err.cause.code || err.cause.message || err.cause})` : '';
+    lastError = String(err) + cause;
+    console.error('[density] refresh failed:', err, err && err.cause);
   }
 }
 
