@@ -19,8 +19,14 @@ const REFRESH_MS = (Number(process.env.REFRESH_MINUTES) || 15) * 60 * 1000;
 
 // OpenSky's anonymous (no-auth) access is capped at 400 credits/day, and a
 // full-globe /states/all call costs 4 credits — so 15-minute polling
-// (~96 calls, 384 credits/day) fits comfortably without registering a key
+// (~96 calls, 384 credits/day) fits comfortably without registering a key.
+// If OPENSKY_CLIENT_ID/SECRET are set (see .env.example), authenticated
+// requests get a much higher daily budget and finer time resolution.
 const OPENSKY_URL = 'https://opensky-network.org/api/states/all';
+const OPENSKY_TOKEN_URL =
+  'https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token';
+const OPENSKY_CLIENT_ID = process.env.OPENSKY_CLIENT_ID;
+const OPENSKY_CLIENT_SECRET = process.env.OPENSKY_CLIENT_SECRET;
 
 let densityGrid = new Float32Array(GRID_W * GRID_H); // all-zero until the first successful fetch
 let rawCounts = new Float32Array(GRID_W * GRID_H); // exact per-cell aircraft counts, pre-blur/compress/normalize
@@ -92,23 +98,38 @@ function normalize(grid) {
   return out;
 }
 
-// one-time diagnostic: is Railway's outbound network blocked entirely, or
-// is this specific to OpenSky? Remove once the real cause is known.
-let outboundDiagnostic = 'not run yet';
-async function checkOutboundConnectivity() {
-  try {
-    const res = await fetch('https://api.github.com', { signal: AbortSignal.timeout(8000) });
-    outboundDiagnostic = `api.github.com reachable, HTTP ${res.status}`;
-  } catch (err) {
-    const cause = err && err.cause ? ` (${err.cause.code || err.cause.message || err.cause})` : '';
-    outboundDiagnostic = `api.github.com FAILED: ${String(err)}${cause}`;
-  }
-  console.log('[diagnostic]', outboundDiagnostic);
+// OAuth2 client-credentials flow (OpenSky retired basic auth in March 2026).
+// Token is cached and reused until shortly before it expires (tokens last
+// 30 minutes) rather than re-fetched on every poll.
+let cachedToken = null;
+let tokenExpiresAt = 0;
+async function getAccessToken() {
+  if (!OPENSKY_CLIENT_ID || !OPENSKY_CLIENT_SECRET) return null;
+  if (cachedToken && Date.now() < tokenExpiresAt) return cachedToken;
+
+  const body = new URLSearchParams({
+    grant_type: 'client_credentials',
+    client_id: OPENSKY_CLIENT_ID,
+    client_secret: OPENSKY_CLIENT_SECRET,
+  });
+  const res = await fetch(OPENSKY_TOKEN_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body,
+    signal: AbortSignal.timeout(10000),
+  });
+  if (!res.ok) throw new Error(`OpenSky token request returned HTTP ${res.status}`);
+  const data = await res.json();
+  cachedToken = data.access_token;
+  tokenExpiresAt = Date.now() + (data.expires_in - 60) * 1000; // refresh a minute early
+  return cachedToken;
 }
 
 async function refreshDensity() {
   try {
-    const res = await fetch(OPENSKY_URL, { signal: AbortSignal.timeout(15000) });
+    const token = await getAccessToken();
+    const headers = token ? { Authorization: `Bearer ${token}` } : {};
+    const res = await fetch(OPENSKY_URL, { headers, signal: AbortSignal.timeout(15000) });
     if (!res.ok) {
       lastError = `OpenSky returned HTTP ${res.status}`;
       console.error('[density] refresh failed:', lastError);
@@ -148,7 +169,6 @@ app.get('/api/density', (req, res) => {
     lastFetchAt,
     lastCount,
     error: lastError,
-    outboundDiagnostic, // TEMP: remove once the OpenSky connectivity issue is diagnosed
   });
 });
 
@@ -167,7 +187,6 @@ app.post('/api/density/refresh', async (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`planetrack server on http://localhost:${PORT}`);
-  checkOutboundConnectivity();
   refreshDensity();
   setInterval(refreshDensity, REFRESH_MS);
 });
