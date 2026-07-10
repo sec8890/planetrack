@@ -1,0 +1,811 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Precipitation Band</title>
+<style>
+  @font-face {
+    font-family: 'Providence Sans';
+    src: url('./fonts/providence-sans-bold.woff2') format('woff2'),
+         url('./fonts/providence-sans-bold.woff') format('woff');
+    font-weight: 700;
+    font-style: normal;
+    font-display: swap;
+  }
+
+  html, body { margin: 0; height: 100%; background: #f4f5f6; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; touch-action: none; }
+
+  #header {
+    position: fixed;
+    left: 48px;
+    top: 44px;
+    max-width: 560px;
+    z-index: 8;
+    pointer-events: none;
+  }
+  #header h1 {
+    margin: 0;
+    font-family: 'Providence Sans', cursive;
+    font-weight: 700;
+    font-size: 26px;
+    line-height: 1.15;
+    color: #1c1f23;
+  }
+  #header p {
+    margin: 8px 0 0;
+    font-family: Georgia, 'Times New Roman', serif;
+    font-size: 12px;
+    line-height: 1.5;
+    color: #2b2f33;
+  }
+
+  #legend {
+    position: fixed;
+    left: 16px;
+    bottom: 16px;
+    max-width: 300px;
+    padding: 10px 13px;
+    background: rgba(255, 255, 255, 0.82);
+    backdrop-filter: blur(4px);
+    border: 1px solid rgba(0, 0, 0, 0.08);
+    border-radius: 8px;
+    font: 10px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    color: #3a3f45;
+    pointer-events: none;
+  }
+  #legend .ramp {
+    height: 8px;
+    border-radius: 4px;
+    margin: 6px 0 4px;
+    background: linear-gradient(to right, #39a4fb, #4a63ec, #b45a8d, #d3a763, #ffff25);
+  }
+  #legend .ramp-labels {
+    display: flex;
+    justify-content: space-between;
+    font-size: 8.5px;
+    color: #6b7178;
+    margin-bottom: 8px;
+  }
+  #legend .note {
+    font-size: 9px;
+    color: #6b7178;
+  }
+
+  #fontCredit {
+    position: fixed;
+    right: 10px;
+    bottom: 6px;
+    font: 8.5px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    color: #b3b8bd;
+    z-index: 8;
+  }
+  #fontCredit a { color: #b3b8bd; }
+
+  #clickLeader {
+    position: fixed;
+    inset: 0;
+    width: 100vw;
+    height: 100vh;
+    pointer-events: none;
+    z-index: 9;
+  }
+  #clickLeader.hidden { display: none; }
+  #clickLeader line { stroke: #6b7178; stroke-width: 1; }
+  #clickLeader circle { fill: none; stroke: #6b7178; stroke-width: 1.2; }
+
+  #clickInfo {
+    position: fixed;
+    pointer-events: none;
+    font: 10px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    color: #5b6167;
+    max-width: 200px;
+    z-index: 10;
+  }
+  #clickInfo.hidden { display: none; }
+  #clickInfo .count {
+    font-size: 11px;
+    font-weight: 500;
+    color: #33373b;
+    letter-spacing: 0.01em;
+    white-space: nowrap;
+  }
+  #clickInfo .loc {
+    font-size: 9.5px;
+    color: #5b6167;
+    margin-top: 2px;
+    white-space: nowrap;
+  }
+  #clickInfo .hint {
+    font-size: 8px;
+    color: #83898f;
+    margin-top: 4px;
+    line-height: 1.4;
+  }
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+
+<div id="header">
+  <h1>where are all of the airplanes?</h1>
+  <p>
+    A live map of where commercial aircraft are most concentrated around the world.<br />
+    Click a region to view an estimate of the number of aircraft in that region.<br />
+    Data is unreliable over bodies of water.
+  </p>
+</div>
+
+<div id="legend">
+  <div><strong>Live aircraft density</strong></div>
+  <div class="ramp"></div>
+  <div class="ramp-labels"><span>fewer</span><span>more</span></div>
+  <div class="note">
+    Source: OpenSky Network (ground-based ADS&#8209;B receivers). Open-ocean
+    corridors (e.g. transatlantic) will under-report — there's no ground
+    coverage over water, not zero real traffic.
+  </div>
+</div>
+
+<div id="fontCredit">
+  Heading font from <a href="https://www.onlinewebfonts.com" target="_blank" rel="noopener">Web Fonts</a>, licensed CC BY 4.0
+</div>
+
+<svg id="clickLeader" class="hidden"><line/><circle r="3.5"/></svg>
+<div id="clickInfo" class="hidden">
+  <div class="count"></div>
+  <div class="loc"></div>
+  <div class="hint">Exact count in this ~2.8°×2.8° grid cell, from live OpenSky data</div>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.161.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.161.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+const canvas = document.getElementById('gl');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: false });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setClearColor(0xf4f5f6, 1);
+
+const scene = new THREE.Scene();
+
+const camera = new THREE.PerspectiveCamera(42, window.innerWidth / window.innerHeight, 0.1, 100);
+camera.position.set(0, 2.9, 4.8);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+controls.enablePan = false;
+controls.minDistance = 3;
+controls.maxDistance = 14;
+controls.minPolarAngle = 0.15;
+controls.maxPolarAngle = Math.PI / 2 + 0.12; // keep the camera from flipping under the sheet
+controls.target.set(0, 0, 0);
+
+// --- lighting: relief map has no texture, so shading carries the terrain ---
+// cool blue-white throughout (sky, key, and rim) instead of the previous
+// warm cream key light, so the shaded extrusion edges read cool/grey
+// rather than tan
+scene.add(new THREE.HemisphereLight(0xeef2f7, 0x2a2f3a, 1.0));
+const key = new THREE.DirectionalLight(0xeaf1fb, 2.2);
+key.position.set(4, 5, 3);
+scene.add(key);
+const rim = new THREE.DirectionalLight(0x9fc6ff, 0.7);
+rim.position.set(-5, -2, -4);
+scene.add(rim);
+
+// the map lies in its native XY plane, facing the camera; this tilts the
+// whole thing back slightly rather than viewing it dead flat-on
+const worldTilt = new THREE.Group();
+worldTilt.rotation.x = -0.14;
+scene.add(worldTilt);
+
+const modelGroup = new THREE.Group();
+worldTilt.add(modelGroup);
+
+const bandPivot = new THREE.Group();
+worldTilt.add(bandPivot);
+
+const MAP_COLOR = 0xf2f0ef; // off-white, single material for the extruded country shapes
+
+new GLTFLoader().load('./world_map_static.glb', (gltf) => {
+  const model = gltf.scene;
+
+  model.traverse((child) => {
+    if (!child.isMesh) return;
+    child.material = new THREE.MeshStandardMaterial({
+      color: MAP_COLOR,
+      roughness: 0.85,
+      metalness: 0.0,
+      flatShading: false,
+      side: THREE.DoubleSide, // stays lit if the camera ever dips under the sheet
+    });
+  });
+
+  // center and normalize scale so the framing/ring math below is predictable
+  const box = new THREE.Box3().setFromObject(model);
+  const center = box.getCenter(new THREE.Vector3());
+  const size = box.getSize(new THREE.Vector3());
+  const maxDim = Math.max(size.x, size.y, size.z) || 1;
+  const targetSize = 3.6;
+  const scale = targetSize / maxDim;
+
+  model.position.sub(center);
+  const wrapper = new THREE.Group();
+  wrapper.add(model);
+  wrapper.scale.setScalar(scale);
+  modelGroup.add(wrapper);
+
+  // this model lies in its local XY plane (X = longitude, Y = latitude),
+  // with Z as the thin terrain-extrusion thickness — so the map's real
+  // footprint for the overlay is X by Y, not X by Z
+  const halfW = (size.x * scale) / 2;
+  const halfH = (size.y * scale) / 2;
+  buildCloudLayer(halfW, halfH);
+  buildOrbitParticles(halfW, halfH);
+});
+
+// --- orbiting precipitation band -----------------------------------------
+
+const bandUniforms = {
+  uTime: { value: 0 },
+};
+
+const bandVertex = `
+varying vec2 vPos;
+void main() {
+  vPos = position.xy;
+  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+}
+`;
+
+// shared noise + color-ramp utilities, reused by both the flat heatmap
+// shader and the halo ring shader below
+const noiseGLSL = `
+vec3 mod289(vec3 x){return x-floor(x*(1.0/289.0))*289.0;}
+vec2 mod289(vec2 x){return x-floor(x*(1.0/289.0))*289.0;}
+vec3 permute(vec3 x){return mod289(((x*34.0)+1.0)*x);}
+float snoise(vec2 v){
+  const vec4 C = vec4(0.211324865405187, 0.366025403784439,
+                      -0.577350269189626, 0.024390243902439);
+  vec2 i  = floor(v + dot(v, C.yy));
+  vec2 x0 = v -   i + dot(i, C.xx);
+  vec2 i1 = (x0.x > x0.y) ? vec2(1.0, 0.0) : vec2(0.0, 1.0);
+  vec4 x12 = x0.xyxy + C.xxzz;
+  x12.xy -= i1;
+  i = mod289(i);
+  vec3 p = permute(permute(i.y + vec3(0.0, i1.y, 1.0))
+          + i.x + vec3(0.0, i1.x, 1.0));
+  vec3 m = max(0.5 - vec3(dot(x0,x0), dot(x12.xy,x12.xy), dot(x12.zw,x12.zw)), 0.0);
+  m = m*m; m = m*m;
+  vec3 x = 2.0 * fract(p * C.www) - 1.0;
+  vec3 h = abs(x) - 0.5;
+  vec3 ox = floor(x + 0.5);
+  vec3 a0 = x - ox;
+  m *= 1.79284291400159 - 0.85373472095314 * (a0*a0 + h*h);
+  vec3 g;
+  g.x  = a0.x  * x0.x  + h.x  * x0.y;
+  g.yz = a0.yz * x12.xz + h.yz * x12.yw;
+  return 130.0 * dot(m, g);
+}
+
+float fbm(vec2 p, int octaves) {
+  float sum = 0.0;
+  float amp = 0.55;
+  float freq = 1.0;
+  for (int i = 0; i < 6; i++) {
+    if (i >= octaves) break;
+    sum += amp * snoise(p * freq);
+    freq *= 2.02;
+    amp *= 0.55;
+  }
+  return sum;
+}
+
+float turb(vec2 p, int octaves) {
+  float sum = 0.0;
+  float amp = 1.0;
+  float freq = 1.0;
+  float norm = 0.0;
+  for (int i = 0; i < 6; i++) {
+    if (i >= octaves) break;
+    sum += amp * abs(snoise(p * freq));
+    norm += amp;
+    freq *= 2.0;
+    amp *= 0.52;
+  }
+  return sum / norm;
+}
+
+vec3 rampColor(float t) {
+  vec3 c0 = vec3(0.224, 0.643, 0.984);
+  vec3 c1 = vec3(0.145, 0.545, 0.980);
+  vec3 c2 = vec3(0.259, 0.404, 0.925);
+  vec3 c3 = vec3(0.451, 0.376, 0.894);
+  vec3 c4 = vec3(0.635, 0.353, 0.867);
+  vec3 c5 = vec3(0.776, 0.545, 0.553);
+  vec3 c6 = vec3(0.827, 0.659, 0.388);
+  vec3 c7 = vec3(1.000, 1.000, 0.145);
+
+  float s = clamp(t, 0.0, 1.0);
+  vec3 col;
+  if (s < 0.16) col = mix(c0, c1, s/0.16);
+  else if (s < 0.34) col = mix(c1, c2, (s-0.16)/0.18);
+  else if (s < 0.50) col = mix(c2, c3, (s-0.34)/0.16);
+  else if (s < 0.62) col = mix(c3, c4, (s-0.50)/0.12);
+  else if (s < 0.74) col = mix(c4, c5, (s-0.62)/0.12);
+  else if (s < 0.87) col = mix(c5, c6, (s-0.74)/0.13);
+  else col = mix(c6, c7, (s-0.87)/0.13);
+  return col;
+}
+`;
+
+const bandFragment = `
+precision highp float;
+varying vec2 vPos;
+uniform float uTime;
+uniform vec2 uHalfSize;
+uniform sampler2D uDensity;
+uniform float uHasDensity;
+
+${noiseGLSL}
+
+void main() {
+  // -1..1 across the padded rectangle that sits over (and a bit past) the
+  // map's footprint
+  vec2 norm = vPos / uHalfSize;
+
+  float dens = 0.0;
+  if (uHasDensity > 0.5) {
+    // real data: uDensity is an equirectangular grid of plane-density values
+    // in [0,1], one bilinear sample per fragment, aligned to this quad's
+    // own footprint (see uDensity setup in buildCloudLayer)
+    dens = texture2D(uDensity, norm * 0.5 + 0.5).r;
+  }
+
+  // organic drift so the layer doesn't look static — with live data this
+  // is a light texture over the real density, not the whole signal
+  float t = uTime * 0.05;
+  vec2 morph = vec2(t * 0.15, -t * 0.11);
+  vec2 warpCoord = norm * 3.2 + morph * 0.3;
+  vec2 warp = vec2(
+    fbm(warpCoord + vec2(11.3, 4.7), 2),
+    fbm(warpCoord + vec2(-3.2, 8.1), 2)
+  ) * 0.18;
+  vec2 sampleP = norm * 3.6 + morph + warp;
+
+  float base = turb(sampleP, 4);
+  float detail = turb(sampleP * 2.2 + vec2(50.0, -20.0) + morph * 1.4, 3);
+  float noiseField = base + detail * 0.3;
+
+  // with live data, density drives the shape and noise only adds texture;
+  // without it, noise alone stands in as a placeholder pattern
+  float field = uHasDensity > 0.5
+    ? (dens * 1.3 + (noiseField - 0.45) * 0.35)
+    : (noiseField - 0.45) * 2.2;
+
+  // feather the padded outer edge so it thins into nothing rather than
+  // stopping in a hard rectangle
+  vec2 edgeDist = 1.0 - abs(norm);
+  float edgeFade = smoothstep(0.0, 0.12, min(edgeDist.x, edgeDist.y));
+
+  float alpha = smoothstep(0.05, 0.35, field) * edgeFade * 0.88;
+  float intensity = smoothstep(0.05, 0.95, field);
+  vec3 color = rampColor(intensity);
+
+  gl_FragColor = vec4(color, alpha);
+}
+`;
+
+// --- orbit particles: individual points actually moving in 3D around the
+// map — passing in front of it, out to the side, and behind it — rather
+// than a static shaded shape. Each particle's brightness is resampled from
+// the real per-longitude density profile as it travels, so the ones
+// crossing over the US/Europe light up while the rest stay dim. Separate
+// from the accurate flat heatmap layer above. -------------------------------
+
+const particleVertex = `
+attribute float aTheta0;
+attribute float aRadiusJitter;
+attribute float aYJitter;
+attribute float aSizeJitter;
+attribute float aSpeedJitter;
+
+uniform float uTime;
+uniform float uRadiusX;
+uniform float uRadiusZ;
+uniform float uHeightScale;
+
+varying float vTheta;
+varying vec2 vDir;
+
+void main() {
+  float theta = aTheta0 + uTime * 0.045 * aSpeedJitter;
+  float rx = uRadiusX * (1.0 + aRadiusJitter);
+  float rz = uRadiusZ * (1.0 + aRadiusJitter);
+  vec3 pos = vec3(cos(theta) * rx, aYJitter * uHeightScale, sin(theta) * rz);
+  vTheta = theta;
+
+  // tangent (velocity) direction along the orbit, analytically — d/dtheta
+  // of the position above — then carried into view space so the fragment
+  // shader knows which way on screen to stretch each particle's streak
+  vec3 tangent = vec3(-sin(theta) * rx, 0.0, cos(theta) * rz);
+  vec3 viewTangent = mat3(modelViewMatrix) * tangent;
+  vDir = length(viewTangent.xy) > 1e-6 ? normalize(viewTangent.xy) : vec2(1.0, 0.0);
+
+  vec4 mvPosition = modelViewMatrix * vec4(pos, 1.0);
+  gl_Position = projectionMatrix * mvPosition;
+  // this scene's camera sits ~5-6 units out (not hundreds), so the
+  // perspective divisor has to be calibrated to that same small scale —
+  // clamped too, so no particle can balloon to a screen-filling blob
+  float perspective = clamp(7.0 / -mvPosition.z, 0.4, 2.2);
+  // bigger than a plain dot needs to be — the streak shape below eats into
+  // this footprint to draw a comet-like tail, not just a filled circle
+  gl_PointSize = (44.0 + aSizeJitter * 18.0) * perspective;
+}
+`;
+
+const particleFragment = `
+precision highp float;
+varying float vTheta;
+varying vec2 vDir;
+uniform sampler2D uProfile;
+uniform float uHasDensity;
+
+${noiseGLSL}
+
+void main() {
+  // gl_PointCoord has +y pointing down the screen; flip so it matches vDir,
+  // which was built from view-space (+y up) coordinates
+  vec2 c = gl_PointCoord - 0.5;
+  c.y = -c.y;
+
+  vec2 dir = vDir;
+  vec2 perp = vec2(-dir.y, dir.x);
+  float along = dot(c, dir);   // + ahead of the particle, - behind it (the tail)
+  float across = dot(c, perp);
+
+  // smoothstep requires edge0 < edge1 (reversed edges are undefined per the
+  // GLSL spec) — invert the result instead of swapping the edges
+  float head = 1.0 - smoothstep(0.04, 0.22, along);
+  float tail = exp(-max(-along, 0.0) * 0.32); // slower decay = a longer visible tail
+
+  // no hard pinpoint core and no clamp-to-1 saturation — two soft layers
+  // instead (a thin threadlike line plus a wider, fainter halo around it)
+  // so it reads as a suggestion of a glow trailing past, not a filled shape
+  float thinLine = exp(-across * across * 260.0) * head * tail;
+  float halo = exp(-across * across * 30.0) * head * tail;
+  float shape = thinLine * 0.5 + halo * 0.22;
+
+  float u = fract(vTheta / 6.28318530718 + 0.5);
+  float dens = uHasDensity > 0.5 ? texture2D(uProfile, vec2(u, 0.5)).r : 0.18;
+
+  vec3 color = rampColor(smoothstep(0.05, 0.9, dens));
+  float alpha = shape * (0.14 + 0.2 * dens); // lighter/more subtle overall
+
+  gl_FragColor = vec4(color, alpha);
+}
+`;
+
+let particlePoints;
+let particleMat;
+function buildOrbitParticles(halfW, halfH) {
+  // kept low deliberately — at high counts neighboring streaks overlap
+  // enough to blend into blob/ring-like interference patterns instead of
+  // reading as individual comet trails
+  const COUNT = 110;
+  const radiusX = halfW * 1.55;
+  const radiusZ = Math.min(halfW, halfH) * 0.55; // flattened ellipse so it visibly dips in front of / behind the map
+  const heightScale = halfH * 0.3; // gentle vertical spread — a loose band, not a razor-thin ring
+
+  const positions = new Float32Array(COUNT * 3); // unused by the shader (position is computed from theta) but three.js requires the attribute
+  const theta0 = new Float32Array(COUNT);
+  const radiusJitter = new Float32Array(COUNT);
+  const yJitter = new Float32Array(COUNT);
+  const sizeJitter = new Float32Array(COUNT);
+  const speedJitter = new Float32Array(COUNT);
+
+  for (let i = 0; i < COUNT; i++) {
+    theta0[i] = (i / COUNT) * Math.PI * 2 + Math.random() * 0.04;
+    radiusJitter[i] = (Math.random() - 0.5) * 0.2;
+    yJitter[i] = (Math.random() - 0.5) * 2.0;
+    sizeJitter[i] = Math.random();
+    speedJitter[i] = 0.85 + Math.random() * 0.3;
+  }
+
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  geo.setAttribute('aTheta0', new THREE.BufferAttribute(theta0, 1));
+  geo.setAttribute('aRadiusJitter', new THREE.BufferAttribute(radiusJitter, 1));
+  geo.setAttribute('aYJitter', new THREE.BufferAttribute(yJitter, 1));
+  geo.setAttribute('aSizeJitter', new THREE.BufferAttribute(sizeJitter, 1));
+  geo.setAttribute('aSpeedJitter', new THREE.BufferAttribute(speedJitter, 1));
+
+  particleMat = new THREE.ShaderMaterial({
+    uniforms: {
+      ...bandUniforms,
+      uRadiusX: { value: radiusX },
+      uRadiusZ: { value: radiusZ },
+      uHeightScale: { value: heightScale },
+      uProfile: { value: null },
+      uHasDensity: { value: 0 },
+    },
+    vertexShader: particleVertex,
+    fragmentShader: particleFragment,
+    transparent: true,
+    depthWrite: false,
+  });
+
+  particlePoints = new THREE.Points(geo, particleMat);
+  // real positions come from the shader (theta0 + uTime), not the zeroed
+  // position attribute, so auto bounding-sphere culling would be wrong here
+  particlePoints.frustumCulled = false;
+  bandPivot.add(particlePoints);
+}
+
+let cloudLayer;
+let cloudMat;
+function buildCloudLayer(halfW, halfH) {
+  // heatmap layer floats over the whole map footprint plus a margin, so it
+  // reads as clouds hovering over the map and spilling a bit past its edges
+  const padding = 1.25;
+  const pw = halfW * padding;
+  const ph = halfH * padding;
+
+  const geo = new THREE.PlaneGeometry(pw * 2, ph * 2);
+
+  cloudMat = new THREE.ShaderMaterial({
+    uniforms: {
+      ...bandUniforms,
+      uHalfSize: { value: new THREE.Vector2(pw, ph) },
+      uDensity: { value: null },
+      uHasDensity: { value: 0 },
+    },
+    vertexShader: bandVertex,
+    fragmentShader: bandFragment,
+    transparent: true,
+    depthWrite: false,
+    side: THREE.DoubleSide,
+  });
+
+  cloudLayer = new THREE.Mesh(geo, cloudMat);
+  // the map lies in the XY plane facing +Z (toward the camera); PlaneGeometry
+  // already faces +Z by default, so no rotation is needed here — just a
+  // small forward offset so the haze sits just in front of the terrain
+  // extrusion instead of intersecting it
+  cloudLayer.position.z = Math.max(halfW, halfH) * 0.02;
+  bandPivot.add(cloudLayer);
+
+  refreshDensityTexture();
+  setInterval(refreshDensityTexture, 5 * 60 * 1000); // just re-polls our own cache; server throttles the real API calls
+}
+
+// --- live flight-density heatmap, served by the local proxy (server.js) ---
+
+// exact per-cell aircraft counts, kept alongside the smoothed/normalized
+// texture so a map click can report a real number (see handleMapClick)
+let densityCounts = null;
+let densityGridW = 0;
+let densityGridH = 0;
+
+async function refreshDensityTexture() {
+  try {
+    const res = await fetch('/api/density');
+    if (!res.ok) return;
+    const data = await res.json();
+    if (!cloudMat || !data.values || !data.width || !data.height) return;
+
+    const { width, height, values } = data;
+    densityCounts = data.counts || null;
+    densityGridW = width;
+    densityGridH = height;
+    const pixels = new Uint8Array(width * height * 4);
+    let hasSignal = false;
+    for (let i = 0; i < width * height; i++) {
+      const v = Math.round(Math.min(1, Math.max(0, values[i])) * 255);
+      if (v > 0) hasSignal = true;
+      pixels[i * 4 + 0] = v;
+      pixels[i * 4 + 1] = v;
+      pixels[i * 4 + 2] = v;
+      pixels[i * 4 + 3] = 255;
+    }
+
+    const tex = new THREE.DataTexture(pixels, width, height, THREE.RGBAFormat);
+    tex.flipY = false; // row 0 = south pole, matching the shader's v=0 mapping
+    tex.minFilter = THREE.LinearFilter;
+    tex.magFilter = THREE.LinearFilter;
+    tex.wrapS = THREE.ClampToEdgeWrapping;
+    tex.wrapT = THREE.ClampToEdgeWrapping;
+    tex.needsUpdate = true;
+
+    const old = cloudMat.uniforms.uDensity.value;
+    cloudMat.uniforms.uDensity.value = tex;
+    cloudMat.uniforms.uHasDensity.value = hasSignal ? 1 : 0;
+    if (old) old.dispose();
+
+    // per-longitude profile (peak density in each column, regardless of
+    // latitude) for the orbit particles — collapses the 2D grid to a 1D
+    // strip so each particle can resample its brightness as it travels
+    if (particleMat) {
+      const profile = new Uint8Array(width * 4);
+      for (let x = 0; x < width; x++) {
+        let m = 0;
+        for (let y = 0; y < height; y++) {
+          const v = values[y * width + x];
+          if (v > m) m = v;
+        }
+        const p = Math.round(Math.min(1, Math.max(0, m)) * 255);
+        profile[x * 4 + 0] = p;
+        profile[x * 4 + 1] = p;
+        profile[x * 4 + 2] = p;
+        profile[x * 4 + 3] = 255;
+      }
+      const profileTex = new THREE.DataTexture(profile, width, 1, THREE.RGBAFormat);
+      profileTex.minFilter = THREE.LinearFilter;
+      profileTex.magFilter = THREE.LinearFilter;
+      profileTex.wrapS = THREE.RepeatWrapping; // longitude wraps seamlessly around the orbit
+      profileTex.needsUpdate = true;
+
+      const oldProfile = particleMat.uniforms.uProfile.value;
+      particleMat.uniforms.uProfile.value = profileTex;
+      particleMat.uniforms.uHasDensity.value = hasSignal ? 1 : 0;
+      if (oldProfile) oldProfile.dispose();
+    }
+
+    if (data.error) console.warn('[density] server reports:', data.error);
+  } catch (err) {
+    console.warn('[density] fetch failed (is server.js running?):', err);
+  }
+}
+
+// --- click-to-query: raycast onto the heatmap plane, convert the hit point
+// to the same lon/lat grid the server bins aircraft into, and report the
+// exact count for that cell -------------------------------------------------
+
+const clickInfoEl = document.getElementById('clickInfo');
+const clickLeaderEl = document.getElementById('clickLeader');
+const clickLeaderLine = clickLeaderEl.querySelector('line');
+const clickLeaderDot = clickLeaderEl.querySelector('circle');
+const raycaster = new THREE.Raycaster();
+const pointerNDC = new THREE.Vector2();
+let pointerDownPos = null;
+
+canvas.addEventListener('pointerdown', (e) => {
+  pointerDownPos = { x: e.clientX, y: e.clientY };
+});
+
+canvas.addEventListener('pointerup', (e) => {
+  const down = pointerDownPos;
+  pointerDownPos = null;
+  if (!down) return;
+  // OrbitControls drags fire the same pointer events — only treat this as a
+  // "click" if the pointer barely moved between down and up
+  if (Math.hypot(e.clientX - down.x, e.clientY - down.y) > 6) return;
+  handleMapClick(e.clientX, e.clientY);
+});
+
+function hideClickInfo() {
+  clickInfoEl.classList.add('hidden');
+  clickLeaderEl.classList.add('hidden');
+}
+
+function handleMapClick(clientX, clientY) {
+  if (!cloudLayer) return;
+
+  const rect = canvas.getBoundingClientRect();
+  pointerNDC.x = ((clientX - rect.left) / rect.width) * 2 - 1;
+  pointerNDC.y = -((clientY - rect.top) / rect.height) * 2 + 1;
+  raycaster.setFromCamera(pointerNDC, camera);
+
+  const hits = raycaster.intersectObject(cloudLayer, false);
+  if (hits.length === 0) {
+    hideClickInfo();
+    return;
+  }
+
+  // same normalized -1..1 coordinate the shader uses for vPos/uHalfSize,
+  // so this lines up exactly with what's rendered on screen
+  const local = cloudLayer.worldToLocal(hits[0].point.clone());
+  const halfSize = cloudMat.uniforms.uHalfSize.value;
+  const u = (local.x / halfSize.x) * 0.5 + 0.5;
+  const v = (local.y / halfSize.y) * 0.5 + 0.5;
+  if (u < 0 || u > 1 || v < 0 || v > 1) {
+    hideClickInfo();
+    return;
+  }
+
+  const lon = u * 360 - 180;
+  const lat = v * 180 - 90;
+
+  let countText = 'Loading…';
+  if (densityCounts && densityGridW && densityGridH) {
+    const col = Math.min(densityGridW - 1, Math.max(0, Math.round(u * (densityGridW - 1))));
+    const row = Math.min(densityGridH - 1, Math.max(0, Math.round(v * (densityGridH - 1))));
+    const count = Math.round(densityCounts[row * densityGridW + col]);
+    countText = count === 1 ? '1 aircraft' : `${count} aircraft`;
+  }
+
+  clickInfoEl.querySelector('.count').textContent = countText;
+  clickInfoEl.querySelector('.loc').textContent =
+    `${Math.abs(lat).toFixed(1)}°${lat >= 0 ? 'N' : 'S'}, ${Math.abs(lon).toFixed(1)}°${lon >= 0 ? 'E' : 'W'}`;
+
+  // label always escapes toward whichever side of the *map* is empty
+  // background — using the click's own map-relative v (north vs south
+  // half), not just screen position, so it reliably clears the heatmap
+  // band into the plain white area above/below it rather than landing back
+  // on top of the map
+  let flipY = v < 0.5; // south half of the map -> escape downward; north half -> escape upward
+  // still guard the actual viewport edges for clicks near the map's own
+  // north/south extremes, where the "away from center" push alone could
+  // still run off the top/bottom of the screen
+  if (!flipY && clientY - rect.top < 120) flipY = true;
+  if (flipY && rect.bottom - clientY < 100) flipY = false;
+  // uses the canvas's own measured bounds rather than window.innerWidth —
+  // viewport reporting isn't always reliable across embedding contexts
+  const flipX = clientX > rect.right - 220;
+  let labelX = clientX + (flipX ? -26 : 26);
+  const labelY = clientY + (flipY ? 60 : -60);
+  // the legend card lives in the bottom-left corner — if the label would
+  // land below and inside that zone, slide it right past the legend rather
+  // than flipping back up onto the map (flipping up would defeat the whole
+  // point of pushing the label into background in the first place)
+  if (flipY && labelX < rect.left + 340 && labelY > rect.bottom - 260) {
+    labelX = rect.left + 350;
+  }
+
+  clickInfoEl.style.left = `${labelX}px`;
+  clickInfoEl.style.top = `${labelY}px`;
+  clickInfoEl.style.transform = `translate(${flipX ? '-100%' : '0'}, ${flipY ? '0' : '-100%'})`;
+  clickInfoEl.classList.remove('hidden');
+
+  clickLeaderLine.setAttribute('x1', labelX);
+  clickLeaderLine.setAttribute('y1', labelY);
+  clickLeaderLine.setAttribute('x2', clientX);
+  clickLeaderLine.setAttribute('y2', clientY);
+  clickLeaderDot.setAttribute('cx', clientX);
+  clickLeaderDot.setAttribute('cy', clientY);
+  clickLeaderEl.classList.remove('hidden');
+}
+
+// --- animation loop: quantized "forecast frame" stepping, as before ------
+
+function onResize() {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+}
+window.addEventListener('resize', onResize);
+
+const start = performance.now();
+const STEP = 0.42;
+const HOLD = 0.62;
+
+function frame() {
+  const t = (performance.now() - start) / 1000;
+  const stepIndex = Math.floor(t / STEP);
+  const stepFrac = (t / STEP) - stepIndex;
+  const eased = Math.min(1, stepFrac / (1 - HOLD));
+  const smooth = eased * eased * (3 - 2 * eased);
+  const quantTime = (stepIndex + smooth) * STEP;
+
+  bandUniforms.uTime.value = quantTime;
+
+  controls.update();
+  renderer.render(scene, camera);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
