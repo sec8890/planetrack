@@ -1,7 +1,14 @@
 import 'dotenv/config';
+import dns from 'dns';
 import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
+
+// some container networks (Railway included) have broken/restricted
+// outbound IPv6 routing while IPv4 works fine — Node's fetch tries IPv6
+// first by default, which manifests as a silent connect timeout rather
+// than a clear error, so prefer IPv4 explicitly
+dns.setDefaultResultOrder('ipv4first');
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
