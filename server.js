@@ -24,11 +24,11 @@ const REFRESH_MS = (Number(process.env.REFRESH_MINUTES) || 15) * 60 * 1000;
 // point+radius queries across the globe and merge the results.
 const ADSB_BASE_URL = 'https://api.adsb.lol/v2/point';
 const TILE_RADIUS_NM = 600;
-const LON_STEP_DEG = 30;
+const LON_STEP_DEG = 45;
 const LAT_STEP_DEG = 30;
 const LAT_MIN = -60; // skip the poles — negligible traffic, not worth the extra tiles
 const LAT_MAX = 60;
-const TILE_DELAY_MS = 1000; // gap between requests — even 350ms sequential still got heavily rate-limited
+const TILE_DELAY_MS = 2000; // gap between requests — even 1s sequential still had a 78% failure rate on Render
 
 function buildTileCenters() {
   const centers = [];
