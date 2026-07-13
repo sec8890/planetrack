@@ -132,7 +132,7 @@
   <p>
     A live map of where commercial aircraft are most concentrated around the world.<br />
     Click a region to view an estimate of the number of aircraft in that region.<br />
-    Data is unreliable over bodies of water.
+    Coverage is sampled in tiles and fills in gradually, so some regions lag a few minutes behind others.
   </p>
 </div>
 
@@ -141,9 +141,12 @@
   <div class="ramp"></div>
   <div class="ramp-labels"><span>fewer</span><span>more</span></div>
   <div class="note">
-    Source: OpenSky Network (ground-based ADS&#8209;B receivers). Open-ocean
-    corridors (e.g. transatlantic) will under-report — there's no ground
-    coverage over water, not zero real traffic.
+    Source: adsb.lol (community ADS&#8209;B network). Coverage is sampled in
+    tiles across the globe rather than one continuous snapshot, and heavily
+    rate-limited — regions whose tile fails to refresh keep showing data
+    from their last successful check instead of going blank. Open-ocean
+    and remote areas will still under-report regardless, since there's
+    little ground-receiver coverage there to sample.
   </div>
 </div>
 
