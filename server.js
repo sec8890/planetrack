@@ -138,8 +138,9 @@ async function checkAlternativeSources() {
     try {
       const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
       const data = await res.json();
-      const count = Array.isArray(data.ac) ? data.ac.length : 'n/a';
-      results.push(`${name}: HTTP ${res.status}, ${count} aircraft`);
+      // adsb.lol uses "ac", adsb.fi uses "aircraft" — different response shapes
+      const list = Array.isArray(data.ac) ? data.ac : Array.isArray(data.aircraft) ? data.aircraft : null;
+      results.push(`${name}: HTTP ${res.status}, ${list ? list.length : 'unknown shape'} aircraft`);
     } catch (err) {
       const cause = err && err.cause ? ` (${err.cause.code || err.cause.message || err.cause})` : '';
       results.push(`${name}: FAILED ${String(err)}${cause}`);
