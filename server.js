@@ -125,6 +125,30 @@ async function getAccessToken() {
   return cachedToken;
 }
 
+// one-time diagnostic: are the free community ADS-B aggregators (much less
+// commonly abused/blocked than OpenSky) actually reachable from here?
+// Remove once the answer is known.
+let altSourceDiagnostic = 'not run yet';
+async function checkAlternativeSources() {
+  const results = [];
+  for (const [name, url] of [
+    ['adsb.lol', 'https://api.adsb.lol/v2/point/27/-80/250'],
+    ['adsb.fi', 'https://opendata.adsb.fi/api/v2/lat/27/lon/-80/dist/250'],
+  ]) {
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
+      const data = await res.json();
+      const count = Array.isArray(data.ac) ? data.ac.length : 'n/a';
+      results.push(`${name}: HTTP ${res.status}, ${count} aircraft`);
+    } catch (err) {
+      const cause = err && err.cause ? ` (${err.cause.code || err.cause.message || err.cause})` : '';
+      results.push(`${name}: FAILED ${String(err)}${cause}`);
+    }
+  }
+  altSourceDiagnostic = results.join(' | ');
+  console.log('[diagnostic]', altSourceDiagnostic);
+}
+
 async function refreshDensity() {
   try {
     const token = await getAccessToken();
@@ -169,6 +193,7 @@ app.get('/api/density', (req, res) => {
     lastFetchAt,
     lastCount,
     error: lastError,
+    altSourceDiagnostic, // TEMP: remove once alternative-source reachability is known
   });
 });
 
@@ -187,6 +212,7 @@ app.post('/api/density/refresh', async (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`planetrack server on http://localhost:${PORT}`);
+  checkAlternativeSources();
   refreshDensity();
   setInterval(refreshDensity, REFRESH_MS);
 });
