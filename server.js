@@ -19,16 +19,19 @@ const REFRESH_MS = (Number(process.env.REFRESH_MINUTES) || 15) * 60 * 1000;
 // OpenSky Network blocks connections from major cloud-hosting IP ranges
 // (confirmed: identical connection timeouts from both Railway and Render,
 // while every other host works fine) — adsb.lol is a free, no-key-required
-// community ADS-B aggregator that doesn't have this problem. It has no
-// single "whole planet" endpoint like OpenSky did, so instead we tile
-// point+radius queries across the globe and merge the results.
+// community ADS-B aggregator that doesn't have this problem, but it rate
+// limits heavily and unpredictably (likely shared across everyone on the
+// same cloud egress IP pool, not just us — slowing our own pacing down
+// barely moved the failure rate). It also has no single "whole planet"
+// endpoint like OpenSky did, so we tile point+radius queries across the
+// globe instead.
 const ADSB_BASE_URL = 'https://api.adsb.lol/v2/point';
 const TILE_RADIUS_NM = 600;
 const LON_STEP_DEG = 45;
 const LAT_STEP_DEG = 30;
 const LAT_MIN = -60; // skip the poles — negligible traffic, not worth the extra tiles
 const LAT_MAX = 60;
-const TILE_DELAY_MS = 2000; // gap between requests — even 1s sequential still had a 78% failure rate on Render
+const TILE_DELAY_MS = 2000; // gap between requests
 
 function buildTileCenters() {
   const centers = [];
@@ -43,15 +46,50 @@ const TILE_CENTERS = buildTileCenters();
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-let densityGrid = new Float32Array(GRID_W * GRID_H); // all-zero until the first successful fetch
+// persists across refresh cycles on purpose: a tile that fails this cycle
+// leaves its region's last known values in place rather than going blank,
+// so a ~80% per-cycle tile failure rate doesn't mean the map loses 80% of
+// itself every 15 minutes — it just means most regions are a cycle or two
+// stale rather than empty
+let densityGrid = new Float32Array(GRID_W * GRID_H);
 let rawCounts = new Float32Array(GRID_W * GRID_H); // exact per-cell aircraft counts, pre-blur/compress/normalize
 let lastFetchAt = 0;
 let lastError = null;
 let lastCount = 0;
 
-// adjacent tiles overlap on purpose (no gaps in coverage), so the same
-// aircraft shows up in multiple tiles' results — dedupe by its unique
-// ICAO24 hex before binning, or overlap zones would look artificially dense
+function normalizeLon(lon) {
+  return ((lon + 180) % 360 + 360) % 360 - 180; // wrap into [-180, 180)
+}
+function lonToCol(lon) {
+  const wrapped = normalizeLon(lon);
+  return Math.min(GRID_W - 1, Math.max(0, Math.round(((wrapped + 180) / 360) * (GRID_W - 1))));
+}
+function latToRow(lat) {
+  return Math.min(GRID_H - 1, Math.max(0, Math.round(((lat + 90) / 180) * (GRID_H - 1))));
+}
+// is lon within [lonMin, lonMax), correctly handling the antimeridian wrap
+// for the tile centered at lon=-180?
+function lonInRange(lon, lonMin, lonMax) {
+  const nLon = normalizeLon(lon);
+  const nMin = normalizeLon(lonMin);
+  const nMax = normalizeLon(lonMax);
+  if (nMin <= nMax) return nLon >= nMin && nLon < nMax;
+  return nLon >= nMin || nLon < nMax; // range itself wraps around
+}
+// grid columns owned by a tile, handling the same antimeridian wrap
+function ownedColumns(lonMin, lonMax) {
+  const colMin = lonToCol(lonMin);
+  const colMax = lonToCol(lonMax);
+  const cols = [];
+  if (colMin <= colMax) {
+    for (let c = colMin; c <= colMax; c++) cols.push(c);
+  } else {
+    for (let c = colMin; c < GRID_W; c++) cols.push(c);
+    for (let c = 0; c <= colMax; c++) cols.push(c);
+  }
+  return cols;
+}
+
 async function fetchTile(lat, lon, attempt = 1) {
   const url = `${ADSB_BASE_URL}/${lat}/${lon}/${TILE_RADIUS_NM}`;
   const res = await fetch(url, { signal: AbortSignal.timeout(12000) });
@@ -64,42 +102,6 @@ async function fetchTile(lat, lon, attempt = 1) {
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const data = await res.json();
   return Array.isArray(data.ac) ? data.ac : [];
-}
-
-async function fetchAllAircraft() {
-  const byHex = new Map();
-  let failedTiles = 0;
-
-  // strictly one request at a time with a gap between — the free tier here
-  // does not tolerate concurrent bursts the way OpenSky's did
-  for (const [lat, lon] of TILE_CENTERS) {
-    try {
-      const aircraft = await fetchTile(lat, lon);
-      for (const ac of aircraft) {
-        if (typeof ac.lat === 'number' && typeof ac.lon === 'number') byHex.set(ac.hex, ac);
-      }
-    } catch (err) {
-      failedTiles++;
-      if (failedTiles <= 3) console.error('[density] tile failed:', err.message); // TEMP diagnostic
-    }
-    await sleep(TILE_DELAY_MS);
-  }
-
-  if (failedTiles > 0) console.warn(`[density] ${failedTiles}/${TILE_CENTERS.length} tiles failed`);
-  return { aircraft: Array.from(byHex.values()), failedTiles };
-}
-
-function binAircraft(aircraft) {
-  const counts = new Float32Array(GRID_W * GRID_H);
-  for (const ac of aircraft) {
-    // adsb.lol reports "ground" (a string) for alt_baro instead of a numeric
-    // altitude when an aircraft is on the ground
-    if (ac.alt_baro === 'ground') continue;
-    const col = Math.min(GRID_W - 1, Math.max(0, Math.round(((ac.lon + 180) / 360) * (GRID_W - 1))));
-    const row = Math.min(GRID_H - 1, Math.max(0, Math.round(((ac.lat + 90) / 180) * (GRID_H - 1))));
-    counts[row * GRID_W + col] += 1;
-  }
-  return counts;
 }
 
 // thousands of points still leaves gaps between grid cells, so spread each
@@ -151,20 +153,55 @@ function normalize(grid) {
 }
 
 async function refreshDensity() {
-  try {
-    const { aircraft, failedTiles } = await fetchAllAircraft();
-    const counts = binAircraft(aircraft);
-    rawCounts = counts;
-    densityGrid = normalize(compress(blur(counts, GRID_W, GRID_H, 2)));
-    lastError = failedTiles > 0 ? `${failedTiles}/${TILE_CENTERS.length} tiles failed (partial data)` : null;
-    lastCount = aircraft.length;
-    lastFetchAt = Date.now();
-    console.log(`[density] refreshed from ${aircraft.length} aircraft (${failedTiles} failed tiles) at ${new Date(lastFetchAt).toISOString()}`);
-  } catch (err) {
-    const cause = err && err.cause ? ` (${err.cause.code || err.cause.message || err.cause})` : '';
-    lastError = String(err) + cause;
-    console.error('[density] refresh failed:', err, err && err.cause);
+  let updatedTiles = 0;
+  let failedTiles = 0;
+
+  for (const [lat, lon] of TILE_CENTERS) {
+    const latMin = lat - LAT_STEP_DEG / 2;
+    const latMax = lat + LAT_STEP_DEG / 2;
+    const lonMin = lon - LON_STEP_DEG / 2;
+    const lonMax = lon + LON_STEP_DEG / 2;
+    const rowMin = latToRow(latMin);
+    const rowMax = latToRow(latMax);
+    const cols = ownedColumns(lonMin, lonMax);
+
+    try {
+      const aircraft = await fetchTile(lat, lon);
+
+      // clear this tile's owned region, then recount only aircraft that
+      // actually fall within it — the query radius overlaps neighboring
+      // tiles on purpose (solid coverage), so some results here belong to
+      // them, not us; filtering by ownership bounds avoids double-counting
+      for (let row = rowMin; row <= rowMax; row++) {
+        for (const col of cols) rawCounts[row * GRID_W + col] = 0;
+      }
+      for (const ac of aircraft) {
+        if (typeof ac.lat !== 'number' || typeof ac.lon !== 'number') continue;
+        if (ac.alt_baro === 'ground') continue;
+        if (ac.lat < latMin || ac.lat >= latMax) continue;
+        if (!lonInRange(ac.lon, lonMin, lonMax)) continue;
+        rawCounts[latToRow(ac.lat) * GRID_W + lonToCol(ac.lon)] += 1;
+      }
+      updatedTiles++;
+    } catch (err) {
+      failedTiles++;
+      // this tile's region just keeps whatever it had from the last
+      // successful cycle instead of going blank
+      if (failedTiles <= 3) console.error('[density] tile failed:', err.message);
+    }
+    await sleep(TILE_DELAY_MS);
   }
+
+  densityGrid = normalize(compress(blur(rawCounts, GRID_W, GRID_H, 2)));
+  lastError =
+    failedTiles > 0
+      ? `${failedTiles}/${TILE_CENTERS.length} tiles failed this cycle (those regions show cached data from an earlier successful cycle)`
+      : null;
+  lastCount = Math.round(rawCounts.reduce((a, b) => a + b, 0));
+  lastFetchAt = Date.now();
+  console.log(
+    `[density] ${updatedTiles}/${TILE_CENTERS.length} tiles refreshed (${failedTiles} failed), ${lastCount} aircraft currently represented at ${new Date(lastFetchAt).toISOString()}`
+  );
 }
 
 const app = express();
