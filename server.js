@@ -4,10 +4,9 @@ import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
-// some container networks (Railway included) have broken/restricted
-// outbound IPv6 routing while IPv4 works fine — Node's fetch tries IPv6
-// first by default, which manifests as a silent connect timeout rather
-// than a clear error, so prefer IPv4 explicitly
+// some container networks have broken/restricted outbound IPv6 routing
+// while IPv4 works fine — Node's fetch tries IPv6 first by default, which
+// manifests as a silent connect timeout rather than a clear error
 dns.setDefaultResultOrder('ipv4first');
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -17,16 +16,32 @@ const GRID_W = 128;
 const GRID_H = 64;
 const REFRESH_MS = (Number(process.env.REFRESH_MINUTES) || 15) * 60 * 1000;
 
-// OpenSky's anonymous (no-auth) access is capped at 400 credits/day, and a
-// full-globe /states/all call costs 4 credits — so 15-minute polling
-// (~96 calls, 384 credits/day) fits comfortably without registering a key.
-// If OPENSKY_CLIENT_ID/SECRET are set (see .env.example), authenticated
-// requests get a much higher daily budget and finer time resolution.
-const OPENSKY_URL = 'https://opensky-network.org/api/states/all';
-const OPENSKY_TOKEN_URL =
-  'https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token';
-const OPENSKY_CLIENT_ID = process.env.OPENSKY_CLIENT_ID;
-const OPENSKY_CLIENT_SECRET = process.env.OPENSKY_CLIENT_SECRET;
+// OpenSky Network blocks connections from major cloud-hosting IP ranges
+// (confirmed: identical connection timeouts from both Railway and Render,
+// while every other host works fine) — adsb.lol is a free, no-key-required
+// community ADS-B aggregator that doesn't have this problem. It has no
+// single "whole planet" endpoint like OpenSky did, so instead we tile
+// point+radius queries across the globe and merge the results.
+const ADSB_BASE_URL = 'https://api.adsb.lol/v2/point';
+const TILE_RADIUS_NM = 600;
+const LON_STEP_DEG = 30;
+const LAT_STEP_DEG = 30;
+const LAT_MIN = -60; // skip the poles — negligible traffic, not worth the extra tiles
+const LAT_MAX = 60;
+const TILE_DELAY_MS = 1000; // gap between requests — even 350ms sequential still got heavily rate-limited
+
+function buildTileCenters() {
+  const centers = [];
+  for (let lat = LAT_MIN; lat <= LAT_MAX; lat += LAT_STEP_DEG) {
+    for (let lon = -180; lon < 180; lon += LON_STEP_DEG) {
+      centers.push([lat, lon]);
+    }
+  }
+  return centers;
+}
+const TILE_CENTERS = buildTileCenters();
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 let densityGrid = new Float32Array(GRID_W * GRID_H); // all-zero until the first successful fetch
 let rawCounts = new Float32Array(GRID_W * GRID_H); // exact per-cell aircraft counts, pre-blur/compress/normalize
@@ -34,17 +49,54 @@ let lastFetchAt = 0;
 let lastError = null;
 let lastCount = 0;
 
-function binStates(states) {
+// adjacent tiles overlap on purpose (no gaps in coverage), so the same
+// aircraft shows up in multiple tiles' results — dedupe by its unique
+// ICAO24 hex before binning, or overlap zones would look artificially dense
+async function fetchTile(lat, lon, attempt = 1) {
+  const url = `${ADSB_BASE_URL}/${lat}/${lon}/${TILE_RADIUS_NM}`;
+  const res = await fetch(url, { signal: AbortSignal.timeout(12000) });
+  if (res.status === 429 || res.status === 420) {
+    // rate-limited — back off and retry once rather than just dropping the tile
+    if (attempt >= 2) throw new Error(`HTTP ${res.status} (gave up after retry)`);
+    await sleep(2000);
+    return fetchTile(lat, lon, attempt + 1);
+  }
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const data = await res.json();
+  return Array.isArray(data.ac) ? data.ac : [];
+}
+
+async function fetchAllAircraft() {
+  const byHex = new Map();
+  let failedTiles = 0;
+
+  // strictly one request at a time with a gap between — the free tier here
+  // does not tolerate concurrent bursts the way OpenSky's did
+  for (const [lat, lon] of TILE_CENTERS) {
+    try {
+      const aircraft = await fetchTile(lat, lon);
+      for (const ac of aircraft) {
+        if (typeof ac.lat === 'number' && typeof ac.lon === 'number') byHex.set(ac.hex, ac);
+      }
+    } catch (err) {
+      failedTiles++;
+      if (failedTiles <= 3) console.error('[density] tile failed:', err.message); // TEMP diagnostic
+    }
+    await sleep(TILE_DELAY_MS);
+  }
+
+  if (failedTiles > 0) console.warn(`[density] ${failedTiles}/${TILE_CENTERS.length} tiles failed`);
+  return { aircraft: Array.from(byHex.values()), failedTiles };
+}
+
+function binAircraft(aircraft) {
   const counts = new Float32Array(GRID_W * GRID_H);
-  for (const s of states) {
-    // state vector layout: [icao24, callsign, origin_country, time_position,
-    // last_contact, longitude, latitude, baro_altitude, on_ground, ...]
-    const lon = s[5];
-    const lat = s[6];
-    const onGround = s[8];
-    if (typeof lat !== 'number' || typeof lon !== 'number' || onGround) continue;
-    const col = Math.min(GRID_W - 1, Math.max(0, Math.round(((lon + 180) / 360) * (GRID_W - 1))));
-    const row = Math.min(GRID_H - 1, Math.max(0, Math.round(((lat + 90) / 180) * (GRID_H - 1))));
+  for (const ac of aircraft) {
+    // adsb.lol reports "ground" (a string) for alt_baro instead of a numeric
+    // altitude when an aircraft is on the ground
+    if (ac.alt_baro === 'ground') continue;
+    const col = Math.min(GRID_W - 1, Math.max(0, Math.round(((ac.lon + 180) / 360) * (GRID_W - 1))));
+    const row = Math.min(GRID_H - 1, Math.max(0, Math.round(((ac.lat + 90) / 180) * (GRID_H - 1))));
     counts[row * GRID_W + col] += 1;
   }
   return counts;
@@ -98,81 +150,17 @@ function normalize(grid) {
   return out;
 }
 
-// OAuth2 client-credentials flow (OpenSky retired basic auth in March 2026).
-// Token is cached and reused until shortly before it expires (tokens last
-// 30 minutes) rather than re-fetched on every poll.
-let cachedToken = null;
-let tokenExpiresAt = 0;
-async function getAccessToken() {
-  if (!OPENSKY_CLIENT_ID || !OPENSKY_CLIENT_SECRET) return null;
-  if (cachedToken && Date.now() < tokenExpiresAt) return cachedToken;
-
-  const body = new URLSearchParams({
-    grant_type: 'client_credentials',
-    client_id: OPENSKY_CLIENT_ID,
-    client_secret: OPENSKY_CLIENT_SECRET,
-  });
-  const res = await fetch(OPENSKY_TOKEN_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body,
-    signal: AbortSignal.timeout(10000),
-  });
-  if (!res.ok) throw new Error(`OpenSky token request returned HTTP ${res.status}`);
-  const data = await res.json();
-  cachedToken = data.access_token;
-  tokenExpiresAt = Date.now() + (data.expires_in - 60) * 1000; // refresh a minute early
-  return cachedToken;
-}
-
-// one-time diagnostic: are the free community ADS-B aggregators (much less
-// commonly abused/blocked than OpenSky) actually reachable from here?
-// Remove once the answer is known.
-let altSourceDiagnostic = 'not run yet';
-async function checkAlternativeSources() {
-  const results = [];
-  for (const [name, url] of [
-    ['adsb.lol', 'https://api.adsb.lol/v2/point/27/-80/250'],
-    ['adsb.fi', 'https://opendata.adsb.fi/api/v2/lat/27/lon/-80/dist/250'],
-  ]) {
-    try {
-      const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
-      const data = await res.json();
-      // adsb.lol uses "ac", adsb.fi uses "aircraft" — different response shapes
-      const list = Array.isArray(data.ac) ? data.ac : Array.isArray(data.aircraft) ? data.aircraft : null;
-      results.push(`${name}: HTTP ${res.status}, ${list ? list.length : 'unknown shape'} aircraft`);
-    } catch (err) {
-      const cause = err && err.cause ? ` (${err.cause.code || err.cause.message || err.cause})` : '';
-      results.push(`${name}: FAILED ${String(err)}${cause}`);
-    }
-  }
-  altSourceDiagnostic = results.join(' | ');
-  console.log('[diagnostic]', altSourceDiagnostic);
-}
-
 async function refreshDensity() {
   try {
-    const token = await getAccessToken();
-    const headers = token ? { Authorization: `Bearer ${token}` } : {};
-    const res = await fetch(OPENSKY_URL, { headers, signal: AbortSignal.timeout(15000) });
-    if (!res.ok) {
-      lastError = `OpenSky returned HTTP ${res.status}`;
-      console.error('[density] refresh failed:', lastError);
-      return;
-    }
-    const data = await res.json();
-    const states = Array.isArray(data.states) ? data.states : [];
-    const counts = binStates(states);
+    const { aircraft, failedTiles } = await fetchAllAircraft();
+    const counts = binAircraft(aircraft);
     rawCounts = counts;
     densityGrid = normalize(compress(blur(counts, GRID_W, GRID_H, 2)));
-    lastError = null;
-    lastCount = states.length;
+    lastError = failedTiles > 0 ? `${failedTiles}/${TILE_CENTERS.length} tiles failed (partial data)` : null;
+    lastCount = aircraft.length;
     lastFetchAt = Date.now();
-    console.log(`[density] refreshed from ${states.length} aircraft states at ${new Date(lastFetchAt).toISOString()}`);
+    console.log(`[density] refreshed from ${aircraft.length} aircraft (${failedTiles} failed tiles) at ${new Date(lastFetchAt).toISOString()}`);
   } catch (err) {
-    // Node's fetch wraps the real network error in a generic "TypeError:
-    // fetch failed" — the actual reason (DNS failure, connection refused,
-    // timeout, etc.) is on err.cause, which String(err) alone doesn't show
     const cause = err && err.cause ? ` (${err.cause.code || err.cause.message || err.cause})` : '';
     lastError = String(err) + cause;
     console.error('[density] refresh failed:', err, err && err.cause);
@@ -194,12 +182,11 @@ app.get('/api/density', (req, res) => {
     lastFetchAt,
     lastCount,
     error: lastError,
-    altSourceDiagnostic, // TEMP: remove once alternative-source reachability is known
   });
 });
 
-// manual refresh — cheap against OpenSky's anonymous budget, but still
-// throttled a little so accidental rapid clicking can't trip their rate limit
+// manual refresh — tiling the globe is heavier than a single OpenSky call
+// was, so keep this throttled to avoid hammering adsb.lol on repeat clicks
 let lastManualRefresh = 0;
 app.post('/api/density/refresh', async (req, res) => {
   if (Date.now() - lastManualRefresh < 60 * 1000) {
@@ -213,7 +200,6 @@ app.post('/api/density/refresh', async (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`planetrack server on http://localhost:${PORT}`);
-  checkAlternativeSources();
   refreshDensity();
   setInterval(refreshDensity, REFRESH_MS);
 });
